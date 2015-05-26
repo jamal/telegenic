@@ -1,7 +1,7 @@
 CC=gcc
 CFLAGS=-c -Wall
 LDFLAGS=-lhttp_parser -levent
-SOURCES=main.c conn.c
+SOURCES=$(wildcard src/*.c)
 OBJECTS=$(SOURCES:.c=.o)
 EXECUTABLE=servertest
 
@@ -14,4 +14,4 @@ $(EXECUTABLE): $(OBJECTS)
 	$(CC) $(CFLAGS) $< -o $@
 
 clean:
-	rm *.o servertest
+	rm src/*.o servertest
