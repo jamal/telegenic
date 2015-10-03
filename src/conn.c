@@ -1,170 +1,306 @@
 #include "conn.h"
-#include <errno.h>
-#include <event2/event.h>
-#include <netdb.h>
-#include <stdio.h>
+#include "rtmp.h"
+
+#include <apr-1/apr_general.h>
+#include <apr-1/apr_pools.h>
+#include <apr-1/apr_hash.h>
+#include <ctype.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 
-int conn_listen(struct event_base *base, const char *host, const char *port, int backlog)
+static apr_pool_t *mp;
+static apr_hash_t *ht;
+
+static void
+conn_add_producer(const char *path, struct conn_client *client)
 {
-	int status;
-	struct addrinfo hints, *servinfo, *p;
-	evutil_socket_t serv_fd;
-	struct event *serv_event;
-
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_PASSIVE;
-
-	if ((status = getaddrinfo(host, port, &hints, &servinfo)) != 0) {
-		perror("conn: getaddrinfo failed");
-		return -1;
-	}
-
-	for (p = servinfo; p != NULL; p = p->ai_next) {
-		if ((serv_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
-			perror("conn: socket failed");
-			continue;
-		}
-
-		if (evutil_make_socket_nonblocking(serv_fd) == -1) {
-			perror("conn: set socket nonblocking");
-			return -1;
-		}
-
-		if (evutil_make_listen_socket_reuseable(serv_fd) == -1) {
-			perror("conn: set socket reusable");
-			return -1;
-		}
-
-		if (bind(serv_fd, p->ai_addr, p->ai_addrlen) == -1) {
-			evutil_closesocket(serv_fd);
-			perror("conn: bind failed");
-			continue;
-		}
-
-		break;
-	}
-
-	if (p == NULL) {
-		perror("conn: failed to find a valid addrinfo");
-		return -1;
-	}
-
-	freeaddrinfo(servinfo);
-
-	if (listen(serv_fd, backlog) == -1) {
-		perror("conn: listen failed");
-		return -1;
-	}
-
-	if ((serv_event = event_new(base, serv_fd, EV_READ|EV_PERSIST, conn_cb_accept, (void*)base)) == NULL) {
-		perror("conn: event_new");
-		return -1;
-	}
-
-	if (event_add(serv_event, NULL) == -1) {
-		perror("conn: event_add");
-		return -1;
-	}
-
-	event_base_dispatch(base);
-
-	event_base_free(base);
-	conn_close(serv_fd);
-
-	return 0;
+	log_debug("Adding producer for: %s", client->path);
+	struct producer *producer = malloc(sizeof(struct producer));
+	producer->client = client;
+	producer->consumer_list = NULL;
+	client->producer = producer;
+	client->is_producer = 1;
+	apr_hash_set(ht, path, APR_HASH_KEY_STRING, producer);
 }
 
-void conn_close(evutil_socket_t fd)
+static struct producer *
+conn_get_producer(const char *path)
 {
-	EVUTIL_CLOSESOCKET(fd);
+	struct producer *producer = apr_hash_get(ht, path, APR_HASH_KEY_STRING);
+	return producer;
 }
 
-struct client * conn_alloc_client(struct event_base *base, evutil_socket_t fd)
+static void
+conn_del_producer(struct conn_client *client)
 {
-	struct client *c = malloc(sizeof(struct client));
-	if (!c) {
-		return NULL;
-	}
-
-	c->ev_read = event_new(base, fd, EV_READ|EV_PERSIST, conn_cb_client_read, c);
-	if (!c->ev_read) {
-		free(c);
-		return NULL;
-	}
-
-	c->ev_write = event_new(base, fd, EV_WRITE|EV_PERSIST, conn_cb_client_write, c);
-	if (!c->ev_write) {
-		event_free(c->ev_read);
-		free(c);
-		return NULL;
-	}
-
-	return c;
-}
-
-void conn_free_client(struct client *c)
-{
-	event_free(c->ev_read);
-	event_free(c->ev_write);
-	free(c);
-}
-
-void conn_cb_accept(evutil_socket_t serv_fd, short what, void *arg)
-{
-	struct event_base *base = arg;
-	struct sockaddr_storage addr;
-	socklen_t addrlen = sizeof(addr);
-	evutil_socket_t client_fd;
-	struct client *c;
-
-	client_fd = accept(serv_fd, (struct sockaddr*)&addr, &addrlen);
-	if (client_fd < 0) {
-		perror("accept");
-		return;
-	} else if (client_fd > FD_SETSIZE) {
-		conn_close(client_fd);
+	struct producer *producer = client->producer;
+	if (producer == NULL) {
 		return;
 	}
-
-	c = conn_alloc_client(base, client_fd);
-	if (c == NULL) {
-		perror("failed to allocate client");
-		return;
+	struct consumer *tmp_c, *c = producer->consumer_list;
+	while (c != NULL) {
+		tmp_c = c;
+		c = c->next;
+		free(tmp_c);
 	}
-
-	event_add(c->ev_read, NULL);
+	if (producer != NULL) {
+		apr_hash_set(ht, client->path, APR_HASH_KEY_STRING, NULL);
+		free(producer);
+	}
 }
 
-void conn_cb_client_read(evutil_socket_t fd, short what, void *arg)
+static void
+conn_add_consumer(struct producer *producer, struct conn_client *client)
 {
-	struct client *c = arg;
-	char buf[1024];
-	ssize_t result;
-
-	bzero(buf, 1024);
-
-	result = recv(fd, buf, sizeof(buf), 0);
-	if (result == 0) {
-		conn_free_client(c);
+	log_debug("Adding consumer to: %s", producer->client->path);
+	struct consumer *c, *consumer;
+	consumer = malloc(sizeof(struct consumer));
+	consumer->client = client;
+	consumer->next = NULL;
+	if (producer->consumer_list == NULL) {
+		producer->consumer_list = consumer;
 		return;
-	} else if (result < 0) {
-		if (errno != EVUTIL_EAI_AGAIN) {
-			perror("recv");
-			conn_free_client(c);
+	}
+	c = producer->consumer_list;
+	while (c->next != NULL) {
+		c = c->next;
+	}
+	c->next = consumer;
+}
+
+static void
+conn_del_consumer(struct conn_client *client)
+{
+	struct producer *producer = client->producer;
+	struct consumer *c, *c_prev;
+	if (client->producer == NULL) {
+		return;
+	}
+	c = producer->consumer_list;
+	while (c != NULL) {
+		if (c->client == client) {
+			if (c == producer->consumer_list) {
+				producer->consumer_list = c->next;
+			} else {
+				c_prev->next = c->next;
+			}
+
+			free(c);
 		}
-		return;
+		c_prev = c;
 	}
-
-	printf("Read: %s", buf);
 }
 
-void conn_cb_client_write(evutil_socket_t fd, short what, void *arg)
+void
+conn_init()
 {
-	printf("client write\n");
+	apr_initialize();
+	apr_pool_create(&mp, NULL);
+	apr_palloc(mp, MEM_ALLOC_SIZE);
+	ht = apr_hash_make(mp);
+}
+
+void
+conn_terminate()
+{
+	apr_pool_destroy(mp);
+	apr_terminate();
+}
+
+void
+conn_buffer_write(struct conn_client *client, char *data, size_t len)
+{
+	struct evbuffer *out = bufferevent_get_output(client->bev);
+	evbuffer_add(out, data, len);
+}
+
+struct conn_client *
+conn_alloc_client(struct bufferevent *bev)
+{
+	struct conn_client *client = malloc(sizeof(struct conn_client));
+	client->bev = bev;
+	client->path = NULL;
+	client->is_producer = 0;
+	client->producer = NULL;
+	return client;
+}
+
+void
+conn_free_client(struct conn_client *client)
+{
+	// Socket is closed when bufferevent is free'd
+	bufferevent_free(client->bev);
+	free(client);
+}
+
+static enum protocol
+conn_determine_protocol(const char *data, size_t len)
+{
+	// RTMP: First packet will be the client RTMP version
+	if (data[0] >= 0x03 && data[0] <= 0x1F) {
+		log_debug("Detected protocol: rtmp");
+		return protocol_rtmp;
+	}
+
+	return protocol_none;
+}
+
+static char *
+conn_read_header(const char *data, struct conn_client *client)
+{
+	size_t len;
+	int is_producer;
+	struct producer *producer;
+	char *pos;
+
+	// Read HTTP Method
+	switch (toupper(data[0])) {
+		case 'P': // POST
+			log_debug("HTTP method POST");
+			is_producer = 1;
+			break;
+		case 'G': // GET
+			log_debug("HTTP method GET");
+			is_producer = 0;
+			break;
+
+		default:
+			return NULL;
+	}
+
+	// Read path
+	pos = strpbrk(data, " ") + 1;
+	if (!pos) return NULL;
+
+	len = (strchr(pos, ' ') - pos);
+	client->path = malloc(len + 1);
+	strncpy(client->path, pos, len);
+	log_debug("Read path %s", client->path);
+
+	// Move pos to the end of the HTTP header
+	pos = strstr(pos, "\r\n") + 2;
+	if (!pos) return NULL;
+
+	producer = conn_get_producer(client->path);
+
+	if (is_producer) {
+		if (producer != NULL) {
+			return NULL;
+		}
+
+		conn_add_producer(client->path, client);
+	} else {
+		if (producer == NULL) {
+			return NULL;
+		}
+
+		conn_add_consumer(producer, client);
+	}
+
+	return pos;
+}
+
+void
+conn_read_cb(struct bufferevent *bev, void *ctx)
+{
+	struct conn_client *client = ctx;
+	struct evbuffer *input = bufferevent_get_input(bev);
+	size_t len = evbuffer_get_length(input);
+	char *data;
+	// struct consumer *consumer;
+
+	if (len) {
+		data = calloc(1, sizeof(char) * len);
+		evbuffer_remove(input, data, len);
+
+		if (client->proto == protocol_none) {
+			client->proto = conn_determine_protocol(data, len);
+		}
+
+		switch (client->proto) {
+			case protocol_rtmp:
+				rtmp_read(client, data, len);
+				break;
+
+			default:
+				log_info("Failed to determine client protocol: %s", data);
+				conn_free_client(client);
+				return;
+		}
+
+		// printf("Reading data\n");
+		// for (int i = 0; i < strlen(data); i++) {
+		// 	printf("%#08x ", data[i]);
+		// }
+		// printf("\n");
+
+		// if (client->path == NULL) {
+		// 	pos = conn_read_header(data, client);
+		// 	if (pos == NULL) {
+		// 		log_debug("Failed to read HTTP header: %s", data);
+		// 		conn_free_client(client);
+		// 		return;
+		// 	}
+		// } else {
+		// 	pos = data;
+		// }
+
+		// if (client->is_producer && client->producer) {
+		// 	consumer = client->producer->consumer_list;
+		// 	while (consumer != NULL) {
+		// 		out = bufferevent_get_output(consumer->client->bev);
+		// 		evbuffer_add(out, pos, len);
+		// 		consumer = consumer->next;
+		// 	}
+		// }
+
+		free(data);
+	}
+}
+
+void
+conn_write_cb(struct bufferevent *bev, void *ctx)
+{
+	// ...
+}
+
+void
+conn_event_cb(struct bufferevent *bev, short events, void *ctx)
+{
+	struct conn_client *client = ctx;
+    if (events & BEV_EVENT_ERROR) {
+		log_err("Error from bufferevent");
+    }
+    if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
+		log_debug("Client connection closed");
+		if (client->is_producer) {
+			conn_del_producer(client);
+		} else {
+			conn_del_consumer(client);
+		}
+		conn_free_client(client);
+    }
+}
+
+void
+conn_accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
+	struct sockaddr *address, int socklen, void *ctx)
+{
+	log_debug("New client connection");
+
+	struct event_base *base = evconnlistener_get_base(listener);
+	struct bufferevent *bev = bufferevent_socket_new(
+		base, fd, BEV_OPT_CLOSE_ON_FREE);
+	struct conn_client *client = conn_alloc_client(bev);
+
+	bufferevent_setcb(bev, conn_read_cb, conn_write_cb, conn_event_cb, client);
+	bufferevent_enable(bev, EV_READ|EV_WRITE);
+}
+
+void
+conn_accept_error_cb(struct evconnlistener *listener, void *ctx)
+{
+	struct event_base *base = evconnlistener_get_base(listener);
+	int err = EVUTIL_SOCKET_ERROR();
+	log_err("Accept error: %d:%s", err, evutil_socket_error_to_string(err));
+	event_base_loopexit(base, NULL);
 }

@@ -1,21 +1,56 @@
-#ifndef __CONN_H__
-#define __CONN_H__
+#ifndef __TELEGENIC_CONN_H__
+#define __TELEGENIC_CONN_H__
 
-#include <event2/event.h>
+#include "log.h"
 
-struct client {
-	struct event *ev_read;
-	struct event *ev_write;
+#include <event2/buffer.h>
+#include <event2/bufferevent.h>
+#include <event2/listener.h>
+
+#define MEM_ALLOC_SIZE 80*1024
+
+enum protocol {
+	protocol_none,
+	protocol_rtmp
 };
 
-int conn_listen(struct event_base *base, const char *host, const char *port, int backlog);
-void conn_close(evutil_socket_t fd);
-void conn_cb_accept(evutil_socket_t serv_fd, short what, void *arg);
+struct consumer {
+	struct conn_client *client;
+	struct consumer* next;
+};
 
-struct client * conn_alloc_client(struct event_base *base, evutil_socket_t fd);
-void conn_free_client(struct client* c);
+struct producer {
+	struct conn_client *client;
+	struct consumer* consumer_list;
+};
 
-void conn_cb_client_read(evutil_socket_t serv_fd, short what, void *arg);
-void conn_cb_client_write(evutil_socket_t serv_fd, short what, void *arg);
+struct conn_client {
+	struct bufferevent *bev;
+	char *path;
+	int is_producer;
+	struct producer *producer;
+
+	enum protocol proto;
+	void *proto_data;
+};
+
+void conn_init();
+void conn_terminate();
+void conn_buffer_write(struct conn_client *client, char *data, size_t len);
+
+struct conn_client *conn_alloc_client(struct bufferevent *bev);
+
+void conn_free_client(struct conn_client *client);
+
+void conn_read_cb(struct bufferevent *bev, void *ctx);
+
+void conn_write_cb(struct bufferevent *bev, void *ctx);
+
+void conn_event_cb(struct bufferevent *bev, short events, void *ctx);
+
+void conn_accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
+	struct sockaddr *address, int socklen, void *ctx);
+
+void conn_accept_error_cb(struct evconnlistener *listener, void *ctx);
 
 #endif

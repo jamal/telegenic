@@ -1,6 +1,6 @@
 CC=gcc
-CFLAGS=-c -Wall
-LDFLAGS=-lhttp_parser -levent
+CFLAGS=-c -Wall -g
+LDFLAGS=-levent -lapr-1
 SOURCES=$(wildcard src/*.c)
 OBJECTS=$(SOURCES:.c=.o)
 EXECUTABLE=servertest
@@ -14,4 +14,7 @@ $(EXECUTABLE): $(OBJECTS)
 	$(CC) $(CFLAGS) $< -o $@
 
 clean:
-	rm src/*.o servertest
+	rm *.o src/*.o servertest example-producer
+
+example-producer: example-producer.o
+	$(CC) $(LDFLAGS) example-producer.o -o $@
